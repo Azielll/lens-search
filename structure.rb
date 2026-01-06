@@ -1,9 +1,9 @@
-open-vocab-visual-search/
+lens-search/
 ├── README.md
 ├── .gitignore
 ├── docker-compose.yml                # optional (local dev for web+api)
 │
-├── web/                              # Next.js app (frontend + BFF endpoints if needed)
+├── frontend/                         # Next.js app (frontend + BFF endpoints if needed)
 │   ├── package.json
 │   ├── next.config.js
 │   ├── tsconfig.json

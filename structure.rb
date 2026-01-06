@@ -34,7 +34,7 @@ lens-search/
 │   │
 │   └── tests/                        # optional
 │
-├── api/                              # FastAPI service (CLIP embed + search)
+├── backend/                              # FastAPI service (CLIP embed + search)
 │   ├── pyproject.toml                # or requirements.txt
 │   ├── requirements.txt              # if you prefer pip
 │   ├── .env.example

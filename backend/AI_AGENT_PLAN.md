@@ -1,0 +1,624 @@
+# AI Agent Code Review - Implementation Plan
+
+## Overview
+This document outlines the plan for building the AI agent component that reviews GitHub pull requests. We're focusing on the core AI logic first, deferring frontend and infrastructure integration.
+
+---
+
+## 1. Architecture Overview
+
+### Core Components
+```
+backend/app/
+├── agents/
+│   ├── __init__.py
+│   ├── planner.py          # Step 2: Planning agent
+│   ├── reviewer.py         # Step 4: Review generation agent
+│   └── fixer.py            # Step 5: Auto-fix agent (future)
+├── services/
+│   ├── context_collector.py    # Step 1: Collect PR context
+│   ├── tool_runner.py          # Step 3: Execute lint/test tools
+│   ├── review_formatter.py     # Format structured reviews
+│   └── safety_checker.py       # Step 6: Safety/guardrails
+├── models/
+│   ├── review.py           # Pydantic models for review structure
+│   ├── plan.py             # Pydantic models for agent plans
+│   └── context.py          # Pydantic models for PR context
+└── utils/
+    ├── github_api.py       # GitHub API client (minimal, for testing)
+    ├── diff_parser.py      # Parse diffs and extract hunks
+    └── prompt_templates.py # LLM prompt templates
+```
+
+---
+
+## 2. Core AI Agent Components
+
+### 2.1 Context Collector (`services/context_collector.py`)
+**Purpose**: Step 1 - Gather all necessary context for the agent
+
+**Responsibilities**:
+- Parse PR diff (files changed, hunks, line numbers)
+- Extract repository metadata:
+  - Detected languages (from file extensions)
+  - Existing CI configs (.github/workflows, package.json, requirements.txt, etc.)
+  - Test/lint commands inferred from configs
+- Collect PR metadata:
+  - Title, description, labels
+  - Author, reviewers
+  - Base/target branches
+- Fetch existing CI status (if available via GitHub API)
+- Structure data into `Context` model
+
+**Input**: PR webhook payload or manual trigger payload
+**Output**: `Context` model (structured data ready for agent)
+
+**Key Functions**:
+- `collect_pr_context(pr_data: dict) -> Context`
+- `parse_diff(diff_text: str) -> List[FileChange]`
+- `detect_languages(files: List[str]) -> List[str]`
+- `infer_ci_commands(repo_config: dict) -> CIConfig`
+
+---
+
+### 2.2 Planning Agent (`agents/planner.py`)
+**Purpose**: Step 2 - Generate a focused review plan based on context
+
+**Responsibilities**:
+- Analyze context (diff size, file types, PR description)
+- Generate structured plan using LLM:
+  - List of review tasks (e.g., "Check correctness in changed functions")
+  - Prioritization (must-fix vs should-fix vs nice-to-have areas)
+  - Tool selection (which linters/tests to run)
+- Apply safety rules:
+  - If diff is huge (>1000 lines), focus on high-risk files only
+  - Skip review if PR is marked as "draft" or specific labels
+
+**LLM Prompt Structure**:
+```
+You are a code review planning agent. Given:
+- PR diff (files changed, hunks)
+- Repository languages: {languages}
+- Available tools: {tools}
+- PR metadata: {title, description}
+
+Generate a focused review plan:
+1. Which areas to check (correctness, security, performance, style)
+2. Which tools to run (eslint, tsc, pytest, ruff, etc.)
+3. Priority level (must-fix vs should-fix vs nice-to-have)
+
+Output JSON:
+{
+  "tasks": [
+    {"type": "correctness", "scope": "changed_functions", "priority": "must"},
+    {"type": "security", "scope": "all", "priority": "must"},
+    ...
+  ],
+  "tools": ["eslint", "tsc"],
+  "focus_files": ["path/to/file.py"]  # if diff is huge
+}
+```
+
+**Input**: `Context` model
+**Output**: `ReviewPlan` model (structured plan)
+
+**Key Functions**:
+- `create_plan(context: Context) -> ReviewPlan`
+- `should_review(context: Context) -> bool` (safety check)
+
+---
+
+### 2.3 Tool Runner (`services/tool_runner.py`)
+**Purpose**: Step 3 - Execute linting/testing tools based on plan
+
+**Responsibilities**:
+- Run tools specified in plan (eslint, tsc, pytest, ruff, etc.)
+- Parse tool output (errors, warnings, test failures)
+- Map results back to specific files/lines from the diff
+- Handle tool failures gracefully (if tool not installed, skip)
+- Support both local execution (for testing) and GitHub Actions environment
+
+**Tool Execution Strategy**:
+- Run tools in isolated subprocesses
+- Parse stdout/stderr for structured output
+- Timeout handling (tools shouldn't hang)
+- Cache results when possible
+
+**Supported Tools** (initially):
+- **TypeScript/JavaScript**: `eslint`, `tsc --noEmit`
+- **Python**: `ruff`, `mypy`, `pytest`
+- **Optional**: `semgrep` (security rules)
+
+**Input**: `ReviewPlan`, `Context` (for file paths)
+**Output**: `ToolResults` model (structured tool outputs)
+
+**Key Functions**:
+- `run_tools(plan: ReviewPlan, context: Context) -> ToolResults`
+- `run_eslint(file_paths: List[str]) -> List[LintError]`
+- `run_tsc(file_paths: List[str]) -> List[TypeError]`
+- `run_ruff(file_paths: List[str]) -> List[LintError]`
+- `run_pytest(test_paths: List[str]) -> TestResults`
+- `parse_tool_output(tool: str, stdout: str, stderr: str) -> List[Issue]`
+
+---
+
+### 2.4 Review Agent (`agents/reviewer.py`)
+**Purpose**: Step 4 - Generate structured review comments from tool results
+
+**Responsibilities**:
+- Analyze tool results + original diff
+- Generate review comments using LLM:
+  - Map tool errors to specific code locations
+  - Add contextual explanations (why it's a problem)
+  - Suggest fixes (code snippets)
+  - Categorize by priority: ✅ Must-fix, ⚠️ Should-fix, 💡 Nice-to-have
+- Ensure comments point to specific file/line or diff hunks
+- Format output as structured review
+
+**LLM Prompt Structure**:
+```
+You are a code review agent. Given:
+- PR diff (with file/line context)
+- Tool results: {tool_results}
+- Review plan: {plan}
+
+Generate structured review comments:
+
+For each issue found:
+1. Category: must-fix / should-fix / nice-to-have
+2. File + line number or diff hunk
+3. Issue description
+4. Suggested fix (if applicable)
+
+Output JSON:
+{
+  "must_fix": [
+    {
+      "file": "src/app.py",
+      "line": 42,
+      "type": "bug",
+      "description": "...",
+      "suggestion": "...",
+      "diff_hunk": "..."  // if applicable
+    }
+  ],
+  "should_fix": [...],
+  "nice_to_have": [...]
+}
+```
+
+**Input**: `ToolResults`, `Context`, `ReviewPlan`
+**Output**: `Review` model (structured review with categorized comments)
+
+**Key Functions**:
+- `generate_review(tool_results: ToolResults, context: Context, plan: ReviewPlan) -> Review`
+- `categorize_issue(issue: Issue, context: Context) -> str` (must/should/nice)
+- `format_comment(issue: Issue) -> ReviewComment`
+
+---
+
+### 2.5 Review Formatter (`services/review_formatter.py`)
+**Purpose**: Format structured review into GitHub comment format
+
+**Responsibilities**:
+- Convert `Review` model to GitHub PR comment format
+- Format as markdown with emojis (✅ ⚠️ 💡)
+- Include code blocks for suggestions
+- Add file/line references (can be clicked in GitHub UI)
+- Group comments by file
+
+**Input**: `Review` model
+**Output**: Formatted markdown string (or GitHub API payload)
+
+**Key Functions**:
+- `format_review(review: Review) -> str` (markdown)
+- `format_for_github_api(review: Review) -> dict` (GitHub API format)
+
+---
+
+### 2.6 Safety Checker (`services/safety_checker.py`)
+**Purpose**: Step 6 - Apply guardrails to prevent annoying/inaccurate reviews
+
+**Responsibilities**:
+- Check if diff is too large → only review high-risk files
+- Check if tests failed for unrelated reasons → comment-only mode
+- Verify coverage/certainty before auto-fixing
+- Skip review if PR has certain labels ("skip-review", "draft")
+- Rate limiting (don't spam if agent is triggered multiple times)
+
+**Key Functions**:
+- `should_review_pr(context: Context) -> Tuple[bool, str]` (bool + reason)
+- `is_diff_too_large(context: Context, threshold: int = 1000) -> bool`
+- `is_high_risk_file(file_path: str) -> bool`
+- `should_auto_fix(review: Review) -> bool`
+
+---
+
+## 3. Data Models (`models/`)
+
+### 3.1 `models/context.py`
+```python
+@dataclass
+class FileChange:
+    path: str
+    additions: int
+    deletions: int
+    hunks: List[DiffHunk]
+
+@dataclass
+class DiffHunk:
+    old_start: int
+    old_lines: int
+    new_start: int
+    new_lines: int
+    content: str
+
+@dataclass
+class CIConfig:
+    languages: List[str]
+    test_command: Optional[str]
+    lint_command: Optional[str]
+    build_command: Optional[str]
+
+@dataclass
+class PRMetadata:
+    title: str
+    description: str
+    labels: List[str]
+    author: str
+    base_branch: str
+    target_branch: str
+
+@dataclass
+class Context:
+    pr_metadata: PRMetadata
+    file_changes: List[FileChange]
+    ci_config: CIConfig
+    diff_text: str  # raw diff
+    ci_status: Optional[str]  # "passing", "failing", None
+```
+
+### 3.2 `models/plan.py`
+```python
+@dataclass
+class ReviewTask:
+    type: str  # "correctness", "security", "performance", "style"
+    scope: str  # "changed_functions", "all", "high_risk_only"
+    priority: str  # "must", "should", "nice"
+
+@dataclass
+class ReviewPlan:
+    tasks: List[ReviewTask]
+    tools: List[str]  # ["eslint", "tsc", "pytest"]
+    focus_files: Optional[List[str]]  # if diff is huge
+    reason: str  # why this plan was chosen
+```
+
+### 3.3 `models/review.py`
+```python
+@dataclass
+class ReviewComment:
+    file: str
+    line: Optional[int]  # None if it's a general file comment
+    diff_hunk: Optional[str]
+    category: str  # "must_fix", "should_fix", "nice_to_have"
+    issue_type: str  # "bug", "security", "performance", "style"
+    description: str
+    suggestion: Optional[str]
+    confidence: float  # 0.0 - 1.0
+
+@dataclass
+class Review:
+    must_fix: List[ReviewComment]
+    should_fix: List[ReviewComment]
+    nice_to_have: List[ReviewComment]
+    summary: str
+    tool_results_summary: str
+```
+
+### 3.4 `models/tool_results.py`
+```python
+@dataclass
+class Issue:
+    file: str
+    line: int
+    column: Optional[int]
+    message: str
+    severity: str  # "error", "warning"
+    rule: Optional[str]  # "eslint-rule-name", etc.
+
+@dataclass
+class TestResult:
+    test_name: str
+    file: str
+    passed: bool
+    failure_message: Optional[str]
+    duration: float
+
+@dataclass
+class ToolResults:
+    lint_errors: List[Issue]  # from eslint, ruff, etc.
+    type_errors: List[Issue]  # from tsc, mypy
+    test_results: List[TestResult]
+    tool_failures: List[str]  # tools that failed to run
+```
+
+---
+
+## 4. LLM Integration
+
+### 4.1 LLM Provider Choice
+- **Primary**: OpenAI GPT-4 (or GPT-4o) for planning and review generation
+- **Alternative**: Anthropic Claude (for longer context windows)
+- **Fallback**: Local LLM (Ollama) for testing without API costs
+
+### 4.2 Prompt Engineering Strategy
+- **Planner**: Focused, concise prompts with structured output (JSON)
+- **Reviewer**: Context-rich prompts with full diff + tool results
+- Use few-shot examples for consistent formatting
+- Temperature: 0.2-0.3 (deterministic, focused)
+
+### 4.3 Prompt Templates (`utils/prompt_templates.py`)
+- Store all prompts as templates with placeholders
+- Easy to iterate on prompts without code changes
+- Support different LLM providers (OpenAI vs Anthropic format)
+
+---
+
+## 5. Dependencies & Tech Stack
+
+### Python Packages
+```
+# Core
+fastapi==0.115.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# LLM
+openai>=1.0.0  # or anthropic
+langchain>=0.1.0  # optional, for structured outputs
+
+# GitHub API (minimal, for testing)
+pygithub>=2.0.0  # or requests for direct API calls
+
+# Diff parsing
+unidiff>=0.7.0  # parse unified diff format
+
+# Tool execution
+subprocess  # built-in
+pathlib  # built-in
+
+# Utilities
+pyyaml>=6.0  # parse CI configs (GitHub Actions, etc.)
+```
+
+### External Tools (assumed to be available)
+- `eslint` (Node.js)
+- `tsc` (TypeScript compiler)
+- `ruff` / `mypy` (Python)
+- `pytest` (Python tests)
+- `semgrep` (optional, security scanning)
+
+---
+
+## 6. Implementation Phases
+
+### Phase 1: Foundation (Week 1)
+**Goal**: Get basic pipeline working end-to-end with mock data
+
+**Tasks**:
+1. Set up project structure (create all empty modules)
+2. Implement data models (`models/*.py`)
+3. Implement `ContextCollector` with mock PR data
+4. Implement basic `Planner` (simple LLM call, hardcoded prompt)
+5. Implement basic `ToolRunner` (mock tool results for now)
+6. Implement basic `Reviewer` (simple LLM call)
+7. Create a test script that runs full pipeline with mock data
+8. Verify end-to-end flow works
+
+**Success Criteria**: 
+- Can run pipeline with mock PR data
+- Produces structured review output (JSON)
+
+---
+
+### Phase 2: Context Collection (Week 1-2)
+**Goal**: Real context collection from PR diffs
+
+**Tasks**:
+1. Implement diff parser (`utils/diff_parser.py`)
+   - Parse unified diff format
+   - Extract file changes and hunks
+   - Map line numbers correctly
+2. Implement language detection (from file extensions)
+3. Implement CI config inference
+   - Parse `package.json` for Node.js projects
+   - Parse `requirements.txt` / `pyproject.toml` for Python
+   - Parse `.github/workflows/*.yml` for GitHub Actions
+4. Integrate with GitHub API (minimal, for testing)
+   - Fetch PR diff
+   - Fetch PR metadata
+5. Test with real PR diff samples
+
+**Success Criteria**:
+- Can parse real GitHub PR diffs
+- Correctly detects languages and tools
+- Produces accurate `Context` model
+
+---
+
+### Phase 3: Tool Execution (Week 2)
+**Goal**: Actually run linting/testing tools
+
+**Tasks**:
+1. Implement tool execution framework
+   - Subprocess execution with timeouts
+   - Error handling (tool not found, crashes)
+   - Output parsing for each tool
+2. Implement parsers for each tool:
+   - ESLint JSON output parser
+   - TypeScript compiler error parser
+   - Ruff output parser
+   - Pytest JSON output parser
+3. Map tool outputs to file/line in PR diff
+4. Test with real repos (clone, checkout PR branch, run tools)
+
+**Success Criteria**:
+- Can run eslint/tsc/ruff/pytest on real code
+- Correctly parses outputs
+- Maps issues to correct file/line numbers
+
+---
+
+### Phase 4: AI Agents (Week 3)
+**Goal**: Smart planning and review generation
+
+**Tasks**:
+1. Refine planner prompts
+   - Add few-shot examples
+   - Test with various PR types (small, large, security-focused, etc.)
+2. Implement structured output parsing (JSON schema validation)
+3. Refine reviewer prompts
+   - Context-aware explanations
+   - Better categorization (must/should/nice)
+   - Useful code suggestions
+4. Add prompt templates system (`utils/prompt_templates.py`)
+5. Test with various real PRs
+6. Iterate on prompts based on output quality
+
+**Success Criteria**:
+- Planner generates focused, relevant plans
+- Reviewer produces high-quality, actionable comments
+- Categories are accurate (must-fix vs nice-to-have)
+
+---
+
+### Phase 5: Safety & Polish (Week 3-4)
+**Goal**: Add guardrails and refine output
+
+**Tasks**:
+1. Implement `SafetyChecker`:
+   - Diff size checks
+   - High-risk file detection
+   - Skip conditions (draft PRs, labels)
+2. Refine review formatting:
+   - Better markdown formatting
+   - Code block syntax highlighting
+   - GitHub-specific formatting (file/line links)
+3. Add error handling throughout pipeline
+4. Add logging/monitoring hooks
+5. Create example outputs for documentation
+
+**Success Criteria**:
+- No false positives on draft PRs
+- Handles large diffs gracefully
+- Review output is well-formatted and readable
+
+---
+
+### Phase 6: Testing & Validation (Week 4)
+**Goal**: Test with real-world scenarios
+
+**Tasks**:
+1. Collect sample PRs from open-source repos
+2. Run agent on various PR types:
+   - Bug fixes
+   - Features
+   - Refactoring
+   - Security patches
+3. Compare agent output with human reviews
+4. Tune prompts/parameters based on results
+5. Document edge cases and limitations
+
+**Success Criteria**:
+- Agent catches real bugs/issues
+- False positive rate is low
+- Output is comparable to human reviewers
+
+---
+
+## 7. Testing Strategy
+
+### Unit Tests
+- Test each component in isolation
+- Mock LLM calls (use fixture responses)
+- Test edge cases (empty diff, huge diff, tool failures)
+
+### Integration Tests
+- Test full pipeline with mock data
+- Test with real PR diffs (fixtures)
+- Test tool execution (requires actual tools installed)
+
+### Manual Testing
+- Run on real open-source PRs
+- Compare output to human reviews
+- Iterate on prompts
+
+---
+
+## 8. Configuration
+
+### Environment Variables
+```
+OPENAI_API_KEY=...
+ANTHROPIC_API_KEY=...  # optional
+GITHUB_TOKEN=...  # for testing GitHub API
+
+# LLM settings
+LLM_MODEL=gpt-4o
+LLM_TEMPERATURE=0.2
+LLM_MAX_TOKENS=4000
+
+# Tool paths (if not in PATH)
+ESLINT_PATH=/usr/local/bin/eslint
+TSC_PATH=/usr/local/bin/tsc
+
+# Safety thresholds
+MAX_DIFF_SIZE=1000
+MIN_AUTO_FIX_CONFIDENCE=0.8
+```
+
+---
+
+## 9. Future Enhancements (Not in Scope Now)
+
+- **Fix Mode**: Auto-generate fixes and create PRs
+- **GitHub Integration**: Webhook handler, PR comment posting
+- **Frontend**: Dashboard for reviewing agent output
+- **CI/CD**: GitHub Actions integration
+- **Advanced Tools**: Semgrep custom rules, dependency scanning
+- **Learning**: Fine-tune on historical PR reviews
+
+---
+
+## 10. Success Metrics
+
+### Phase 1 Success
+- ✅ Pipeline runs end-to-end with mock data
+- ✅ Produces structured JSON output
+
+### Phase 2-3 Success
+- ✅ Correctly parses real PR diffs
+- ✅ Successfully runs tools on real code
+- ✅ Maps issues to correct locations
+
+### Phase 4 Success
+- ✅ Planner generates relevant plans
+- ✅ Reviewer catches real bugs/issues
+- ✅ False positive rate < 20%
+
+### Phase 5-6 Success
+- ✅ Handles edge cases gracefully
+- ✅ Output quality comparable to human reviewers
+- ✅ Ready for integration with GitHub
+
+---
+
+## Notes
+
+- Start simple: mock data → real parsing → real tools → real AI
+- Iterate on prompts frequently (they make the biggest difference)
+- Test with real PRs early (not just synthetic data)
+- Keep LLM calls focused (don't send entire repo, just relevant diffs)
+- Cache tool results when possible (don't re-run on every iteration)
+

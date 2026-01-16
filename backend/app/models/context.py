@@ -39,9 +39,40 @@ class PRMetadata(BaseModel):
     target_branch: str
 
 
+# RAG-related models
+class CodePattern(BaseModel):
+    """A similar code pattern found in the codebase via RAG."""
+    file_path: str
+    code_snippet: str
+    similarity_score: float
+    description: str  # What pattern this represents
+
+
+class BestPractice(BaseModel):
+    """A best practice or guideline retrieved from documentation."""
+    source: str  # e.g., "docs/coding-standards.md" or "ARCHITECTURE.md"
+    content: str
+    relevance: str  # Why this is relevant to the PR
+
+
+class RelatedFile(BaseModel):
+    """A file related to the PR changes (imports, tests, docs, etc.)."""
+    path: str
+    relationship: str  # e.g., "imports", "used_by", "test_file", "documentation"
+    reason: str  # Why this file is relevant
+
+
+class RetrievedKnowledge(BaseModel):
+    """Knowledge retrieved from codebase via RAG."""
+    similar_patterns: List[CodePattern] = []
+    best_practices: List[BestPractice] = []
+    related_files: List[RelatedFile] = []
+
+
 class Context(BaseModel):
     """Complete context about a PR for code review."""
     pr_metadata: PRMetadata
     file_changes: List[FileChange] = []
     ci_config: CIConfig
     diff_text: str  # Raw diff string for LLM prompts
+    retrieved_knowledge: Optional[RetrievedKnowledge] = None  # RAG-retrieved context

@@ -17,6 +17,7 @@ backend/app/
 │   └── fixer.py            # Step 5: Auto-fix agent (future)
 ├── services/
 │   ├── context_collector.py    # Step 1: Collect PR context
+│   ├── knowledge_retriever.py  # Step 1.5: RAG - Retrieve codebase patterns
 │   ├── tool_runner.py          # Step 3: Execute lint/test tools
 │   ├── review_formatter.py     # Format structured reviews
 │   └── safety_checker.py       # Step 6: Safety/guardrails
@@ -27,7 +28,8 @@ backend/app/
 └── utils/
     ├── github_api.py       # GitHub API client (minimal, for testing)
     ├── diff_parser.py      # Parse diffs and extract hunks
-    └── prompt_templates.py # LLM prompt templates
+    ├── prompt_templates.py # LLM prompt templates
+    └── codebase_indexer.py # Index codebase for RAG (embeddings, vector DB)
 ```
 
 ---
@@ -61,6 +63,58 @@ backend/app/
 
 ---
 
+### 2.1.5 Knowledge Retriever (`services/knowledge_retriever.py`)
+**Purpose**: Step 1.5 - Retrieve relevant codebase patterns and knowledge using RAG
+
+**Responsibilities**:
+- Retrieve similar code patterns from the codebase (functions, classes, modules)
+- Find project-specific best practices and architectural patterns
+- Identify related files that might be affected by PR changes
+- Access documentation, style guides, and coding standards
+- Provide contextual knowledge to enhance review quality
+
+**RAG Pipeline**:
+1. **Indexing** (one-time or periodic):
+   - Generate embeddings for all source code files
+   - Index documentation files (docs/, README.md, ARCHITECTURE.md)
+   - Index test files to understand testing patterns
+   - Store embeddings in vector database
+
+2. **Retrieval** (on-demand during PR review):
+   - For each changed function/class: retrieve top-K similar implementations
+   - For changed APIs: retrieve related documentation and test patterns
+   - For architectural changes: retrieve architectural guidelines and patterns
+   - Filter and rank retrieved results by relevance
+
+3. **Context Enhancement**:
+   - Format retrieved code patterns for LLM consumption
+   - Include file paths and line numbers for reference
+   - Provide summaries of coding conventions found
+
+**Retrieval Strategies**:
+- **Semantic Search**: Use code embeddings to find functionally similar code
+- **Pattern Matching**: Find code following similar patterns (same module, same interface)
+- **Dependency Analysis**: Find files that import/use changed files
+- **Documentation Lookup**: Retrieve relevant docs based on changed functionality
+
+**Input**: `Context` model (file changes, diff text)
+**Output**: `RetrievedKnowledge` model (similar patterns, best practices, related files)
+
+**Key Functions**:
+- `retrieve_similar_patterns(file_change: FileChange) -> List[CodePattern]`
+- `retrieve_best_practices(context: Context) -> List[BestPractice]`
+- `retrieve_related_files(file_changes: List[FileChange]) -> List[RelatedFile]`
+- `retrieve_architectural_patterns(context: Context) -> List[ArchPattern]`
+- `index_codebase(repo_path: str) -> None` (one-time setup)
+
+**Example Use Cases**:
+- Reviewing `authenticate_user()` → Retrieve other auth functions to check consistency
+- Adding API endpoint → Retrieve API documentation and test patterns
+- Creating service class → Retrieve existing service patterns and architecture docs
+- Changing import → Find all usages of that import to check for breaking changes
+
+---
+
 ### 2.2 Planning Agent (`agents/planner.py`)
 **Purpose**: Step 2 - Generate a focused review plan based on context
 
@@ -81,11 +135,14 @@ You are a code review planning agent. Given:
 - Repository languages: {languages}
 - Available tools: {tools}
 - PR metadata: {title, description}
+- Retrieved codebase patterns: {similar_patterns}
+- Related files: {related_files}
 
 Generate a focused review plan:
-1. Which areas to check (correctness, security, performance, style)
+1. Which areas to check (correctness, security, performance, style, consistency)
 2. Which tools to run (eslint, tsc, pytest, ruff, etc.)
 3. Priority level (must-fix vs should-fix vs nice-to-have)
+4. Areas to check for consistency with existing codebase patterns
 
 Output JSON:
 {
@@ -99,7 +156,7 @@ Output JSON:
 }
 ```
 
-**Input**: `Context` model
+**Input**: `Context` model, `RetrievedKnowledge` (from RAG)
 **Output**: `ReviewPlan` model (structured plan)
 
 **Key Functions**:
@@ -161,6 +218,9 @@ You are a code review agent. Given:
 - PR diff (with file/line context)
 - Tool results: {tool_results}
 - Review plan: {plan}
+- Similar codebase patterns: {similar_patterns}
+- Project best practices: {best_practices}
+- Related files: {related_files}
 
 Generate structured review comments:
 
@@ -187,7 +247,7 @@ Output JSON:
 }
 ```
 
-**Input**: `ToolResults`, `Context`, `ReviewPlan`
+**Input**: `ToolResults`, `Context`, `ReviewPlan`, `RetrievedKnowledge` (from RAG)
 **Output**: `Review` model (structured review with categorized comments)
 
 **Key Functions**:
@@ -270,12 +330,39 @@ class PRMetadata:
     target_branch: str
 
 @dataclass
+class CodePattern:
+    file_path: str
+    code_snippet: str
+    similarity_score: float
+    description: str  # What pattern this represents
+
+@dataclass
+class BestPractice:
+    source: str  # "docs/coding-standards.md" or "ARCHITECTURE.md"
+    content: str
+    relevance: str  # Why this is relevant to the PR
+
+@dataclass
+class RelatedFile:
+    path: str
+    relationship: str  # "imports", "used_by", "test_file", "documentation"
+    reason: str  # Why this file is relevant
+
+@dataclass
+class RetrievedKnowledge:
+    similar_patterns: List[CodePattern]
+    best_practices: List[BestPractice]
+    related_files: List[RelatedFile]
+    architectural_patterns: List[str]  # Relevant architectural guidelines
+
+@dataclass
 class Context:
     pr_metadata: PRMetadata
     file_changes: List[FileChange]
     ci_config: CIConfig
     diff_text: str  # raw diff
     ci_status: Optional[str]  # "passing", "failing", None
+    retrieved_knowledge: Optional[RetrievedKnowledge] = None  # RAG-retrieved context
 ```
 
 ### 3.2 `models/plan.py`
@@ -378,6 +465,12 @@ python-dotenv>=1.0.0
 openai>=1.0.0  # or anthropic
 langchain>=0.1.0  # optional, for structured outputs
 
+# RAG (Retrieval-Augmented Generation)
+chromadb>=0.4.0  # vector database for code embeddings
+# OR pinecone-client>=3.0.0  # managed vector DB
+# OR weaviate-client>=4.0.0  # self-hosted option
+tiktoken>=0.5.0  # token counting for embeddings
+
 # GitHub API (minimal, for testing)
 pygithub>=2.0.0  # or requests for direct API calls
 
@@ -398,6 +491,11 @@ pyyaml>=6.0  # parse CI configs (GitHub Actions, etc.)
 - `ruff` / `mypy` (Python)
 - `pytest` (Python tests)
 - `semgrep` (optional, security scanning)
+
+### RAG Infrastructure
+- **Embedding Model**: OpenAI `text-embedding-3-small` or `text-embedding-ada-002`
+- **Vector Database**: Chroma (local, default) or Pinecone/Weaviate (managed/self-hosted)
+- **Code Indexing**: Periodic indexing of codebase (on main branch updates or manual trigger)
 
 ---
 
@@ -439,11 +537,18 @@ pyyaml>=6.0  # parse CI configs (GitHub Actions, etc.)
    - Fetch PR diff
    - Fetch PR metadata
 5. Test with real PR diff samples
+6. **Implement RAG infrastructure** (`utils/codebase_indexer.py`, `services/knowledge_retriever.py`)
+   - Set up vector database (Chroma or alternative)
+   - Implement codebase indexing (generate embeddings for all source files)
+   - Implement retrieval functions (semantic search for similar patterns)
+   - Integrate with Context Collector to retrieve knowledge for each PR
 
 **Success Criteria**:
 - Can parse real GitHub PR diffs
 - Correctly detects languages and tools
 - Produces accurate `Context` model
+- Successfully indexes codebase and retrieves relevant patterns
+- Retrieved knowledge enhances review context with similar code patterns
 
 ---
 
@@ -477,19 +582,28 @@ pyyaml>=6.0  # parse CI configs (GitHub Actions, etc.)
 1. Refine planner prompts
    - Add few-shot examples
    - Test with various PR types (small, large, security-focused, etc.)
+   - Integrate retrieved knowledge from RAG into planning prompts
 2. Implement structured output parsing (JSON schema validation)
 3. Refine reviewer prompts
-   - Context-aware explanations
+   - Context-aware explanations using retrieved code patterns
    - Better categorization (must/should/nice)
-   - Useful code suggestions
+   - Useful code suggestions based on similar patterns found via RAG
+   - Consistency checks against codebase patterns
 4. Add prompt templates system (`utils/prompt_templates.py`)
-5. Test with various real PRs
+5. Test with various real PRs (with and without RAG for comparison)
 6. Iterate on prompts based on output quality
+7. **Tune RAG retrieval**:
+   - Optimize embedding models and similarity thresholds
+   - Balance retrieved context size vs. relevance
+   - Test different retrieval strategies (semantic vs. pattern-based)
 
 **Success Criteria**:
 - Planner generates focused, relevant plans
 - Reviewer produces high-quality, actionable comments
 - Categories are accurate (must-fix vs nice-to-have)
+- RAG successfully retrieves relevant code patterns (similarity > 0.7)
+- Reviews reference codebase patterns and suggest consistency improvements
+- RAG-enhanced reviews catch more consistency/style issues than baseline
 
 ---
 
@@ -569,6 +683,23 @@ LLM_MODEL=gpt-4o
 LLM_TEMPERATURE=0.2
 LLM_MAX_TOKENS=4000
 
+# Embedding model (for RAG)
+EMBEDDING_MODEL=text-embedding-3-small
+# OR EMBEDDING_MODEL=text-embedding-ada-002
+
+# Vector database settings
+VECTOR_DB_TYPE=chroma  # or "pinecone", "weaviate"
+CHROMA_PERSIST_DIR=./data/chroma_db
+# If using Pinecone:
+# PINECONE_API_KEY=...
+# PINECONE_ENVIRONMENT=...
+# PINECONE_INDEX_NAME=lenssearch-code-index
+
+# RAG retrieval settings
+RAG_TOP_K=5  # Number of similar patterns to retrieve
+RAG_SIMILARITY_THRESHOLD=0.7  # Minimum similarity score
+RAG_ENABLED=true  # Toggle RAG on/off
+
 # Tool paths (if not in PATH)
 ESLINT_PATH=/usr/local/bin/eslint
 TSC_PATH=/usr/local/bin/tsc
@@ -588,6 +719,11 @@ MIN_AUTO_FIX_CONFIDENCE=0.8
 - **CI/CD**: GitHub Actions integration
 - **Advanced Tools**: Semgrep custom rules, dependency scanning
 - **Learning**: Fine-tune on historical PR reviews
+- **Advanced RAG**:
+  - Incremental indexing (only re-index changed files)
+  - Multi-modal RAG (include diagrams, architecture docs)
+  - Cross-repository pattern learning
+  - Historical PR review knowledge base (learn from past reviews)
 
 ---
 
@@ -616,9 +752,15 @@ MIN_AUTO_FIX_CONFIDENCE=0.8
 
 ## Notes
 
-- Start simple: mock data → real parsing → real tools → real AI
+- Start simple: mock data → real parsing → real tools → real AI → RAG enhancement
 - Iterate on prompts frequently (they make the biggest difference)
 - Test with real PRs early (not just synthetic data)
-- Keep LLM calls focused (don't send entire repo, just relevant diffs)
+- Keep LLM calls focused (don't send entire repo, just relevant diffs + retrieved patterns)
 - Cache tool results when possible (don't re-run on every iteration)
+- **RAG considerations**:
+  - Index codebase once (or periodically), retrieve on-demand
+  - Balance retrieval quality vs. context size (top-K patterns only)
+  - RAG is optional enhancement - system should work without it for MVP
+  - Consider codebase size: may need chunking for large repos
+  - Test retrieval relevance before integrating into prompts
 
